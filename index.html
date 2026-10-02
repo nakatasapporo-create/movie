@@ -422,7 +422,7 @@ document.querySelectorAll('[data-icon]').forEach(el => el.innerHTML = icon(el.da
 const video = $('video');
 let state = { start: 0, end: 14, cuts: [] };
 let duration = 14, mode = 'trim', cutStart = 3, cutEnd = 6, source = DEMO_SOURCE, currentFile = null;
-let previewing = false, loading = true, exporting = false, controller, toastTimer, loadGeneration = 0;
+let previewing = false, previewStarting = false, loading = true, exporting = false, controller, toastTimer, loadGeneration = 0;
 let history = [], future = [], gestureSnapshot = null;
 let cutStatus = 'selecting', editingCut = null;
 const snapshot = () => JSON.stringify(state);
@@ -482,7 +482,7 @@ function render() {
   $('undoButton').disabled = !history.length || loading;
   $('redoButton').disabled = !future.length || loading;
   $('topExport').disabled = loading || totalOutput() < 0.1;
-  $('previewButton').disabled = loading || totalOutput() < 0.1;
+  $('previewButton').disabled = loading || previewStarting || totalOutput() < 0.1;
   $('addCut').disabled = loading || end - start < .1 - 1e-6;
   $('leftHandle').setAttribute('aria-valuenow', String(start)); $('rightHandle').setAttribute('aria-valuenow', String(end));
   for (const el of [$('track'), $('leftHandle'), $('rightHandle')]) el.setAttribute('aria-valuemax', String(duration));
@@ -583,7 +583,7 @@ function updatePlayback() {
   $('playButton').innerHTML = icon(video.paused ? 'play' : 'pause'); $('playButton').setAttribute('aria-label', video.paused ? '再生' : '停止');
   $('stagePlay').hidden = !video.paused || loading;
   $('previewChip').textContent = previewing ? '編集後のプレビュー' : 'オリジナル';
-  if (previewing && !video.paused && !video.seeking) {
+  if (previewing && !previewStarting && !video.paused && !video.seeking) {
     const keep = segments();
     const next = keep.find(s => s.end > video.currentTime + .015);
     if (!next) { video.pause(); video.currentTime = keep.at(-1).end; }
@@ -597,8 +597,21 @@ $('forwardButton').onclick = () => { previewing = false; video.currentTime = Mat
 $('muteButton').onclick = () => { video.muted = !video.muted; $('muteButton').innerHTML = icon(video.muted ? 'mute' : 'volume'); $('muteButton').setAttribute('aria-label', video.muted ? 'ミュート解除' : 'ミュート'); };
 $('fullscreenButton').onclick = async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else if (video.requestFullscreen) await video.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else toast('このブラウザは全画面表示に対応していません。'); } catch { toast('全画面表示を開始できませんでした。'); } };
 $('previewButton').onclick = async () => {
-  const keep = segments(); if (!keep.length) return; video.pause(); previewing = true;
-  try { await seekVideo(video, keep[0].start); await video.play(); } catch { toast('プレビューを開始できませんでした。'); } updatePlayback();
+  const keep = segments(); if (loading || previewStarting || !keep.length) return;
+  video.pause(); previewing = true; previewStarting = true; $('previewButton').disabled = true;
+  const startup = new AbortController();
+  try {
+    const positioned = seekVideo(video, keep[0].start, startup.signal);
+    positioned.catch(() => {}); // Also handle a synchronous play() failure.
+    // Call play within the click, before awaiting seeked: browsers may require
+    // this user gesture again when replaying from the end of a preview.
+    await Promise.all([positioned, video.play()]);
+  } catch (error) {
+    startup.abort(); video.pause();
+    if (error.name !== 'AbortError') toast('プレビューを開始できませんでした。');
+  } finally {
+    previewStarting = false; $('previewButton').disabled = loading || totalOutput() < .1; updatePlayback();
+  }
 };
 ['timeupdate', 'play', 'pause', 'ended', 'seeked'].forEach(event => video.addEventListener(event, updatePlayback));
 let playbackFrame;
