@@ -422,7 +422,7 @@ document.querySelectorAll('[data-icon]').forEach(el => el.innerHTML = icon(el.da
 const video = $('video');
 let state = { start: 0, end: 14, cuts: [] };
 let duration = 14, mode = 'trim', cutStart = 3, cutEnd = 6, source = DEMO_SOURCE, currentFile = null;
-let previewing = false, previewStarting = false, loading = true, exporting = false, controller, toastTimer, loadGeneration = 0;
+let previewing = false, previewStarting = false, previewStartup = null, loading = true, exporting = false, controller, toastTimer, loadGeneration = 0;
 let history = [], future = [], gestureSnapshot = null;
 let cutStatus = 'selecting', editingCut = null;
 const snapshot = () => JSON.stringify(state);
@@ -456,7 +456,7 @@ function render() {
     const times = document.createElement('span'); times.textContent = `${timeText(cut.start)} 〜 ${timeText(cut.end)}`;
     label.append(name, times);
     const edit = document.createElement('button'); edit.className = 'cut-row-button'; edit.textContent = '修正'; edit.setAttribute('aria-label', `削除区間 ${i + 1} を修正`);
-    edit.onclick = () => { video.pause(); previewing = false; editingCut = i; cutStatus = 'editing'; cutStart = cut.start; cutEnd = cut.end; video.currentTime = cut.start; render(); };
+    edit.onclick = () => { pausePlayback(); previewing = false; editingCut = i; cutStatus = 'editing'; cutStart = cut.start; cutEnd = cut.end; video.currentTime = cut.start; render(); };
     const remove = document.createElement('button'); remove.className = 'cut-row-button'; remove.textContent = '取り消す'; remove.setAttribute('aria-label', `削除区間 ${i + 1} を取り消す`);
     remove.onclick = () => { commit(() => { state.cuts.splice(i, 1); editingCut = null; cutStatus = state.cuts.length ? 'saved' : 'selecting'; }); toast('この区間の削除を取り消しました。'); };
     row.append(label, edit, remove); $('cutList').append(row);
@@ -482,7 +482,6 @@ function render() {
   $('undoButton').disabled = !history.length || loading;
   $('redoButton').disabled = !future.length || loading;
   $('topExport').disabled = loading || totalOutput() < 0.1;
-  $('previewButton').disabled = loading || previewStarting || totalOutput() < 0.1;
   $('addCut').disabled = loading || end - start < .1 - 1e-6;
   $('leftHandle').setAttribute('aria-valuenow', String(start)); $('rightHandle').setAttribute('aria-valuenow', String(end));
   for (const el of [$('track'), $('leftHandle'), $('rightHandle')]) el.setAttribute('aria-valuemax', String(duration));
@@ -510,14 +509,14 @@ function beginNewCut() {
   const next = available.find(s => s.end > cursor + .1 - 1e-6) || available[0];
   cutStart = clamp(cursor, next.start, next.end - .1);
   cutEnd = Math.min(next.end, cutStart + 1);
-  cutStatus = 'selecting'; editingCut = null; video.pause(); previewing = false; video.currentTime = cutStart;
+  cutStatus = 'selecting'; editingCut = null; pausePlayback(); previewing = false; video.currentTime = cutStart;
   render();
 }
 $('newCutButton').onclick = beginNewCut;
 $('cancelCutEdit').onclick = () => { const original = state.cuts[editingCut]; if (original) { cutStart = original.start; cutEnd = original.end; } editingCut = null; cutStatus = 'saved'; render(); toast('区間の修正をやめました。'); };
 function setRange(isStart, value, save = true) {
   if (loading || !Number.isFinite(value) || mode === 'cut' && cutStatus === 'saved') return;
-  if (mode === 'cut') { video.pause(); previewing = false; }
+  if (mode === 'cut') { pausePlayback(); previewing = false; }
   const apply = () => {
     if (mode === 'trim') { if (isStart) state.start = clamp(value, 0, state.end - .1); else state.end = clamp(value, state.start + .1, duration); }
     else {
@@ -544,8 +543,8 @@ for (const [id, isStart] of [['startInput', true], ['endInput', false]]) {
   });
   $(id).addEventListener('keydown', event => { if (event.key === 'Enter') $(id).blur(); });
 }
-$('setStart').onclick = () => { const time = video.currentTime; video.pause(); setRange(true, time); };
-$('setEnd').onclick = () => { const time = video.currentTime; video.pause(); setRange(false, time); };
+$('setStart').onclick = () => { const time = video.currentTime; pausePlayback(); setRange(true, time); };
+$('setEnd').onclick = () => { const time = video.currentTime; pausePlayback(); setRange(false, time); };
 $('trimTab').onclick = () => setMode('trim'); $('cutTab').onclick = () => setMode('cut');
 $('addCut').onclick = () => {
   if (loading || cutStatus === 'saved') return;
@@ -560,14 +559,14 @@ $('addCut').onclick = () => {
   commit(() => { state.cuts = cuts; editingCut = null; cutStatus = 'saved'; });
   toast(replacing ? '削除区間の変更を保存しました。' : `一覧に追加しました（${state.cuts.length}か所）。「＋ 次の削除区間を選ぶ」で続けられます。`);
 };
-$('resetButton').onclick = () => { video.pause(); previewing = false; cutStatus = 'selecting'; editingCut = null; commit(() => state = { start: 0, end: duration, cuts: [] }); cutStart = 0; cutEnd = Math.min(1, duration); setMode('trim'); video.currentTime = 0; toast('編集をリセットしました。'); };
+$('resetButton').onclick = () => { pausePlayback(); previewing = false; cutStatus = 'selecting'; editingCut = null; commit(() => state = { start: 0, end: duration, cuts: [] }); cutStart = 0; cutEnd = Math.min(1, duration); setMode('trim'); video.currentTime = 0; toast('編集をリセットしました。'); };
 function undo() { if (!history.length || loading) return; future.push(snapshot()); state = JSON.parse(history.pop()); editingCut = null; cutStatus = state.cuts.length ? 'saved' : 'selecting'; render(); }
 function redo() { if (!future.length || loading) return; history.push(snapshot()); state = JSON.parse(future.pop()); editingCut = null; cutStatus = state.cuts.length ? 'saved' : 'selecting'; render(); }
 $('undoButton').onclick = undo; $('redoButton').onclick = redo;
 const timeAt = event => clamp((event.clientX - $('track').getBoundingClientRect().left) / $('track').getBoundingClientRect().width * duration, 0, duration);
 for (const [id, isStart] of [['leftHandle', true], ['rightHandle', false]]) {
   $(id).onpointerdown = event => {
-    if (loading) return; event.preventDefault(); event.stopPropagation(); video.pause(); gestureSnapshot = snapshot(); $(id).setPointerCapture(event.pointerId);
+    if (loading) return; event.preventDefault(); event.stopPropagation(); pausePlayback(); gestureSnapshot = snapshot(); $(id).setPointerCapture(event.pointerId);
   };
   $(id).onpointermove = event => { if ($(id).hasPointerCapture(event.pointerId)) { setRange(isStart, timeAt(event), false); video.currentTime = currentRange()[isStart ? 0 : 1]; } };
   const finish = () => { if (gestureSnapshot && gestureSnapshot !== snapshot()) remember(gestureSnapshot); gestureSnapshot = null; render(); };
@@ -580,39 +579,77 @@ function updatePlayback() {
   $('currentTime').textContent = timeText(video.currentTime || 0); $('totalTime').textContent = timeText(duration);
   $('playhead').style.left = `${clamp(video.currentTime / duration * 100, 0, 100)}%`;
   $('track').setAttribute('aria-valuenow', String(video.currentTime || 0));
-  $('playButton').innerHTML = icon(video.paused ? 'play' : 'pause'); $('playButton').setAttribute('aria-label', video.paused ? '再生' : '停止');
+  $('playButton').innerHTML = icon(video.paused ? 'play' : 'pause'); $('playButton').setAttribute('aria-label', video.paused ? '再生' : '一時停止');
   $('stagePlay').hidden = !video.paused || loading;
   $('previewChip').textContent = previewing ? '編集後のプレビュー' : 'オリジナル';
   if (previewing && !previewStarting && !video.paused && !video.seeking) {
     const keep = segments();
     const next = keep.find(s => s.end > video.currentTime + .015);
-    if (!next) { video.pause(); video.currentTime = keep.at(-1).end; }
+    if (!keep.length) pausePlayback();
+    else if (!next) { pausePlayback(); video.currentTime = keep.at(-1).end; }
     else if (video.currentTime < next.start) video.currentTime = next.start;
   }
+  const keep = segments(), atEnd = keep.length && video.currentTime >= keep.at(-1).end - .015;
+  const running = previewing && (previewStarting || !video.paused);
+  const label = !previewing ? '編集結果をプレビュー' : running ? 'プレビューを一時停止' : atEnd ? 'もう一度プレビュー' : '続きから再生';
+  const button = $('previewButton');
+  button.disabled = loading || totalOutput() < .1;
+  if (button.dataset.playbackLabel !== label) {
+    button.dataset.playbackLabel = label;
+    button.innerHTML = icon(running ? 'pause' : 'play') + ' ' + label;
+    button.setAttribute('aria-label', label);
+  }
 }
-async function togglePlay() { if (loading) return; if (!video.paused) video.pause(); else { const keep = segments(); if (previewing && keep.length && (video.currentTime >= keep.at(-1).end - .02 || video.currentTime < keep[0].start)) video.currentTime = keep[0].start; else if (video.ended) video.currentTime = 0; try { await video.play(); } catch { toast('動画を再生できませんでした。'); } } }
+function pausePlayback() {
+  // Invalidate a pending start before pausing, so its late promise cannot
+  // interrupt the next user-requested playback.
+  const startup = previewStartup;
+  previewStartup = null; previewStarting = false;
+  startup?.abort(); video.pause(); updatePlayback();
+}
+async function startEditedPreview() {
+  const keep = segments(); if (loading || !keep.length) return;
+  const next = previewing && !video.ended ? keep.find(s => s.end > video.currentTime + .015) : null;
+  const start = next ? Math.max(next.start, video.currentTime) : keep[0].start;
+  pausePlayback(); previewing = true; previewStarting = true;
+  const startup = new AbortController(); previewStartup = startup;
+  updatePlayback();
+  try {
+    const positioned = seekVideo(video, start, startup.signal);
+    positioned.catch(() => {});
+    // Preserve the click's playback permission while seeking or resuming.
+    await Promise.all([positioned, video.play()]);
+  } catch (error) {
+    if (previewStartup === startup) {
+      pausePlayback();
+      if (error.name !== 'AbortError') toast('プレビューを開始できませんでした。');
+    }
+  } finally {
+    if (previewStartup === startup) {
+      previewStartup = null; previewStarting = false; updatePlayback();
+    }
+  }
+}
+function toggleEditedPreview() {
+  if (loading) return;
+  if (previewing && (previewStarting || !video.paused)) pausePlayback();
+  else return startEditedPreview();
+}
+async function togglePlay() {
+  if (loading) return;
+  if (previewing) return toggleEditedPreview();
+  if (!video.paused) pausePlayback();
+  else {
+    if (video.ended) video.currentTime = 0;
+    try { await video.play(); } catch { toast('動画を再生できませんでした。'); }
+  }
+}
 $('playButton').onclick = togglePlay; $('stagePlay').onclick = togglePlay;
 $('backButton').onclick = () => { previewing = false; video.currentTime = Math.max(0, video.currentTime - 3); };
 $('forwardButton').onclick = () => { previewing = false; video.currentTime = Math.min(duration, video.currentTime + 3); };
 $('muteButton').onclick = () => { video.muted = !video.muted; $('muteButton').innerHTML = icon(video.muted ? 'mute' : 'volume'); $('muteButton').setAttribute('aria-label', video.muted ? 'ミュート解除' : 'ミュート'); };
 $('fullscreenButton').onclick = async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else if (video.requestFullscreen) await video.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else toast('このブラウザは全画面表示に対応していません。'); } catch { toast('全画面表示を開始できませんでした。'); } };
-$('previewButton').onclick = async () => {
-  const keep = segments(); if (loading || previewStarting || !keep.length) return;
-  video.pause(); previewing = true; previewStarting = true; $('previewButton').disabled = true;
-  const startup = new AbortController();
-  try {
-    const positioned = seekVideo(video, keep[0].start, startup.signal);
-    positioned.catch(() => {}); // Also handle a synchronous play() failure.
-    // Call play within the click, before awaiting seeked: browsers may require
-    // this user gesture again when replaying from the end of a preview.
-    await Promise.all([positioned, video.play()]);
-  } catch (error) {
-    startup.abort(); video.pause();
-    if (error.name !== 'AbortError') toast('プレビューを開始できませんでした。');
-  } finally {
-    previewStarting = false; $('previewButton').disabled = loading || totalOutput() < .1; updatePlayback();
-  }
-};
+$('previewButton').onclick = toggleEditedPreview;
 ['timeupdate', 'play', 'pause', 'ended', 'seeked'].forEach(event => video.addEventListener(event, updatePlayback));
 let playbackFrame;
 video.addEventListener('play', () => { cancelAnimationFrame(playbackFrame); const tick = () => { updatePlayback(); if (!video.paused) playbackFrame = requestAnimationFrame(tick); }; tick(); });
@@ -658,7 +695,7 @@ function loadFile(file) {
   if (!file || exporting) return;
   if (!file.type.startsWith('video/') && !/\.(mp4|mov|webm|m4v)$/i.test(file.name)) { toast('動画ファイルを選択してください。'); return; }
   if (file.size > 500 * 1024 * 1024) { toast('500 MB以下の動画を選択してください。'); return; }
-  video.pause(); const old = source; source = URL.createObjectURL(file); currentFile = file; loading = true; previewing = false; loadGeneration++;
+  pausePlayback(); const old = source; source = URL.createObjectURL(file); currentFile = file; loading = true; previewing = false; loadGeneration++;
   $('videoLoading').textContent = '動画を読み込み中…'; $('videoLoading').hidden = false; $('thumbnails').replaceChildren();
   video.src = source; video.load(); if (old.startsWith('blob:') && old !== DEMO_SOURCE) URL.revokeObjectURL(old); render();
 }
@@ -686,7 +723,7 @@ $('normalizeAudio').onchange = () => {
 $('topExport').onclick = () => {
   formats = supportedFormats();
   if (!formats.length || !window.AudioContext && !window.webkitAudioContext) { toast('書き出しに対応した最新版のChrome、Edge、Safariで開いてください。'); return; }
-  video.pause(); $('exportLength').textContent = timeText(totalOutput());
+  pausePlayback(); $('exportLength').textContent = timeText(totalOutput());
   $('exportFormat').replaceChildren(...formats.map((f, i) => { const option = document.createElement('option'); option.value = i; option.textContent = f.label; return option; }));
   $('exportProgress').hidden = true; $('startExport').disabled = false; $('startExport').innerHTML = icon('download') + ' 書き出してダウンロード';
   $('normalizeAudio').onchange();
