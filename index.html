@@ -273,9 +273,13 @@ function waitFor(element, event, signal, timeout = 15000) {
   });
 }
 async function seekVideo(video, time, signal) {
-  if (Math.abs(video.currentTime - time) < 0.001 && video.readyState >= 2) return;
+  signal?.throwIfAborted();
+  const atTarget = Math.abs(video.currentTime - time) < 0.001;
+  if (atTarget && !video.seeking && video.readyState >= 2) return;
   const promise = waitFor(video, 'seeked', signal);
-  video.currentTime = time;
+  // A completed preview may already be rewinding here. Do not restart that
+  // same seek: reuse its seeked event and buffered first frame.
+  if (!atTarget || !video.seeking) video.currentTime = time;
   await promise;
 }
 // Chromium's WebM recorder omits Duration. Add it so downloaded clips have a finite duration.
@@ -422,7 +426,7 @@ document.querySelectorAll('[data-icon]').forEach(el => el.innerHTML = icon(el.da
 const video = $('video');
 let state = { start: 0, end: 14, cuts: [] };
 let duration = 14, mode = 'trim', cutStart = 3, cutEnd = 6, source = DEMO_SOURCE, currentFile = null;
-let previewing = false, previewStarting = false, previewStartup = null, loading = true, exporting = false, controller, toastTimer, loadGeneration = 0;
+let previewing = false, previewStarting = false, previewCompleted = false, previewStartup = null, loading = true, exporting = false, controller, toastTimer, loadGeneration = 0;
 let history = [], future = [], gestureSnapshot = null;
 let cutStatus = 'selecting', editingCut = null;
 const snapshot = () => JSON.stringify(state);
@@ -582,16 +586,12 @@ function updatePlayback() {
   $('playButton').innerHTML = icon(video.paused ? 'play' : 'pause'); $('playButton').setAttribute('aria-label', video.paused ? '再生' : '一時停止');
   $('stagePlay').hidden = !video.paused || loading;
   $('previewChip').textContent = previewing ? '編集後のプレビュー' : 'オリジナル';
-  if (previewing && !previewStarting && !video.paused && !video.seeking) {
-    const keep = segments();
-    const next = keep.find(s => s.end > video.currentTime + .015);
-    if (!keep.length) pausePlayback();
-    else if (!next) { pausePlayback(); video.currentTime = keep.at(-1).end; }
-    else if (video.currentTime < next.start) video.currentTime = next.start;
-  }
+  // Rendering is deliberately passive: queued pause/seeked notifications from
+  // a previous run must never pause or seek a newer playback request.
+  if (!previewing) previewCompleted = false;
   const keep = segments(), atEnd = keep.length && video.currentTime >= keep.at(-1).end - .015;
   const running = previewing && (previewStarting || !video.paused);
-  const label = !previewing ? '編集結果をプレビュー' : running ? 'プレビューを一時停止' : atEnd ? 'もう一度プレビュー' : '続きから再生';
+  const label = !previewing ? '編集結果をプレビュー' : running ? 'プレビューを一時停止' : previewCompleted || atEnd ? 'もう一度プレビュー' : '続きから再生';
   const button = $('previewButton');
   button.disabled = loading || totalOutput() < .1;
   if (button.dataset.playbackLabel !== label) {
@@ -599,6 +599,21 @@ function updatePlayback() {
     button.innerHTML = icon(running ? 'pause' : 'play') + ' ' + label;
     button.setAttribute('aria-label', label);
   }
+}
+function finishEditedPreview() {
+  if (!previewing || previewStarting || previewCompleted) return;
+  const keep = segments();
+  previewCompleted = true; pausePlayback();
+  // Prepare and buffer the next start while paused, instead of seeking TO the
+  // media end and doing a competing rewind/play when the user clicks again.
+  if (keep.length && Math.abs(video.currentTime - keep[0].start) > .001) video.currentTime = keep[0].start;
+  updatePlayback();
+}
+function advanceEditedPreview() {
+  if (!previewing || previewStarting || previewCompleted || video.paused || video.seeking) return;
+  const keep = segments(), next = keep.find(s => s.end > video.currentTime + .015);
+  if (!next) finishEditedPreview();
+  else if (video.currentTime < next.start) video.currentTime = next.start;
 }
 function pausePlayback() {
   // Invalidate a pending start before pausing, so its late promise cannot
@@ -609,9 +624,10 @@ function pausePlayback() {
 }
 async function startEditedPreview() {
   const keep = segments(); if (loading || !keep.length) return;
-  const next = previewing && !video.ended ? keep.find(s => s.end > video.currentTime + .015) : null;
+  const next = previewing && !previewCompleted && !video.ended ? keep.find(s => s.end > video.currentTime + .015) : null;
   const start = next ? Math.max(next.start, video.currentTime) : keep[0].start;
-  pausePlayback(); previewing = true; previewStarting = true;
+  if (!video.paused || previewStartup) pausePlayback();
+  previewing = true; previewCompleted = false; previewStarting = true;
   const startup = new AbortController(); previewStartup = startup;
   updatePlayback();
   try {
@@ -626,7 +642,9 @@ async function startEditedPreview() {
     }
   } finally {
     if (previewStartup === startup) {
-      previewStartup = null; previewStarting = false; updatePlayback();
+      previewStartup = null; previewStarting = false;
+      if (video.ended) finishEditedPreview();
+      updatePlayback();
     }
   }
 }
@@ -651,9 +669,16 @@ $('muteButton').onclick = () => { video.muted = !video.muted; $('muteButton').in
 $('fullscreenButton').onclick = async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else if (video.requestFullscreen) await video.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else toast('このブラウザは全画面表示に対応していません。'); } catch { toast('全画面表示を開始できませんでした。'); } };
 $('previewButton').onclick = toggleEditedPreview;
 ['timeupdate', 'play', 'pause', 'ended', 'seeked'].forEach(event => video.addEventListener(event, updatePlayback));
+video.addEventListener('timeupdate', () => { advanceEditedPreview(); updatePlayback(); });
+video.addEventListener('ended', () => { if (video.ended) finishEditedPreview(); });
 let playbackFrame;
-video.addEventListener('play', () => { cancelAnimationFrame(playbackFrame); const tick = () => { updatePlayback(); if (!video.paused) playbackFrame = requestAnimationFrame(tick); }; tick(); });
-video.addEventListener('pause', () => cancelAnimationFrame(playbackFrame));
+function trackPlayback() {
+  cancelAnimationFrame(playbackFrame);
+  const tick = () => { advanceEditedPreview(); updatePlayback(); if (!video.paused) playbackFrame = requestAnimationFrame(tick); };
+  tick();
+}
+video.addEventListener('play', trackPlayback);
+video.addEventListener('pause', () => { if (video.paused) cancelAnimationFrame(playbackFrame); });
 async function makeThumbnails(src, generation) {
   const temp = document.createElement('video'); temp.muted = true; temp.preload = 'auto'; temp.src = src;
   const canvas = document.createElement('canvas'); canvas.width = 160; canvas.height = 90;
